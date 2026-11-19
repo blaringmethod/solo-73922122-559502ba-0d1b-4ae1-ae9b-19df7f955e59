@@ -9,7 +9,9 @@
 - GET  /api/admin/state 内部状态（含格内检出数）
 - POST /api/preview    预览交集检出总数并做安全评估
 - POST /api/publish    确认发布（按最新公开记录重核后原子写入）
-- GET  /api/public     公开数据（人数 + 获准汇总）
+- POST /api/submissions/import  上传报送补正/作废 CSV（整批收或整批拒）
+- GET  /api/reconciliation      报送逐格对账（含差额、额外组合、批次审计）
+- GET  /api/public     公开数据（人数 + 获准汇总，不含上报明细）
 """
 
 import asyncio
@@ -24,17 +26,24 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .database import (
+    accept_submissions,
+    aggregate_submissions,
+    connect,
     get_cells,
     get_publications,
+    get_submission_batches,
     init_db,
     insert_cells,
     insert_publication,
 )
 from .solver import evaluate
+from .submissions import SubmissionConflict, parse_submission_csv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SAMPLE_CSV = BASE_DIR / "sample_survey.csv"
+SAMPLE_SUBMISSIONS = BASE_DIR / "sample_submissions.csv"
+SAMPLE_CORRECTIONS = BASE_DIR / "sample_submissions_corrections.csv"
 
 MAX_CELLS = 16
 MIN_POPULATION = 5
@@ -61,6 +70,13 @@ _HEADER_ALIASES = {
     "population": {"人数", "population", "pop"},
     "detected": {"检出数", "detected", "count"},
 }
+
+
+def _decode_csv(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "文件编码须为 UTF-8")
 
 
 def parse_survey_csv(text: str) -> list[dict]:
@@ -161,6 +177,16 @@ def sample_csv():
     return FileResponse(SAMPLE_CSV, media_type="text/csv")
 
 
+@app.get("/sample_submissions.csv", include_in_schema=False)
+def sample_submissions_csv():
+    return FileResponse(SAMPLE_SUBMISSIONS, media_type="text/csv")
+
+
+@app.get("/sample_submissions_corrections.csv", include_in_schema=False)
+def sample_corrections_csv():
+    return FileResponse(SAMPLE_CORRECTIONS, media_type="text/csv")
+
+
 # ---------------- 接口 ----------------
 
 
@@ -169,10 +195,7 @@ async def import_csv(file: UploadFile = File(...)):
     if get_cells():
         raise HTTPException(409, "调查数据已导入，不可更换")
     raw = await file.read()
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        raise HTTPException(400, "文件编码须为 UTF-8")
+    text = _decode_csv(raw)
     try:
         rows = parse_survey_csv(text)
     except ValueError as e:
@@ -187,6 +210,70 @@ async def import_csv(file: UploadFile = File(...)):
         "districts": sorted({r["district"] for r in rows}),
         "age_groups": sorted({r["age_group"] for r in rows}),
     }
+
+
+@app.post("/api/submissions/import", status_code=201)
+async def import_submissions(file: UploadFile = File(...)):
+    """上传报送补正/作废 CSV；任一行非法或与已提交记录冲突则整批拒收。
+
+    拒收时旧结果保持不变；成功时整批单事务落库，重启后仍可查询对账。
+    """
+    if not get_cells():
+        raise HTTPException(400, "尚未导入调查数据，无法对账")
+    raw = await file.read()
+    text = _decode_csv(raw)
+    try:
+        rows = parse_submission_csv(text)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    try:
+        summary = await asyncio.to_thread(
+            accept_submissions, file.filename or "upload.csv", rows
+        )
+    except SubmissionConflict as e:
+        raise HTTPException(409, str(e))
+    except Exception:
+        raise HTTPException(500, "保存失败，整批未接收，旧结果不变")
+    return {
+        "batch_id": summary["batch_id"],
+        "rows_parsed": len(rows),
+        "rows_accepted": summary["rows_accepted"],
+        "rows_duplicate": summary["rows_duplicate"],
+        "rows_superseded": summary["rows_superseded"],
+    }
+
+
+@app.get("/api/reconciliation")
+def reconciliation():
+    """对账：逐格汇总、相对固定调查的差额、范围外组合单列。
+
+    有效报送、批次与调查格在同一次数据库读事务中读出，
+    保证逐格汇总和差额对应同一批已提交记录（不会跨上传批次撕裂）。
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN")  # 同一快照内读取全部对账数据
+        cell_rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT district, age_group, population, detected FROM cells "
+                "ORDER BY district, age_group"
+            ).fetchall()
+        ]
+        if not cell_rows:
+            raise HTTPException(400, "尚未导入调查数据")
+        agg = aggregate_submissions(conn, cell_rows)
+        batches = get_submission_batches(conn)
+        conn.execute("COMMIT")
+    except HTTPException:
+        conn.execute("ROLLBACK")
+        raise
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    return {**agg, "batches": batches}
 
 
 @app.get("/api/admin/state")

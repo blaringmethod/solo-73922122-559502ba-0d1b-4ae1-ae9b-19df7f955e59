@@ -12,9 +12,12 @@
   main{max-width:1000px;margin:20px auto;padding:0 16px}
   section{background:#fff;border-radius:8px;padding:16px 20px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
   h2{font-size:16px;margin:0 0 12px}
+  h3{font-size:14px;margin:16px 0 6px}
   table{border-collapse:collapse;margin-top:8px}
   th,td{border:1px solid #dde3ea;padding:6px 12px;font-size:14px;text-align:center}
   th{background:#eef2f6}
+  td.neg{color:#b42318;font-weight:600}
+  td.pos{color:#0a6b3d;font-weight:600}
   button{background:#0f4c81;color:#fff;border:0;border-radius:6px;padding:8px 16px;font-size:14px;cursor:pointer;margin-right:8px}
   button.secondary{background:#5a6b7b}
   .checks{margin:6px 0}
@@ -61,6 +64,23 @@
     <h2>4. 已公开记录（不可撤销）</h2>
     <div id="pubs"></div>
   </section>
+
+  <section id="reconSec" class="hidden">
+    <h2>5. 报送补正 / 作废对账</h2>
+    <p class="hint">
+      CSV 表头：报送ID,修订号,分区,年龄组,人数,检出数,作废标记。修订号为正整数；
+      有效记录须满足 0 ≤ 检出数 ≤ 人数；作废标记可用 是/否、1/0、true/false（留空视为否）。
+      同一报送ID 只以最高修订贡献汇总；更高修订到达后旧版不再计入（迟到旧版也不会复活）。
+      同 ID 同修订内容相同的重传不重复计数；内容冲突或任一行非法则整批拒收，旧结果不变。
+    </p>
+    <input type="file" id="subFile" accept=".csv">
+    <button onclick="uploadSubmissions()">上传报送 CSV</button>
+    <button class="secondary" onclick="uploadSample('sample_submissions.csv')">导入示例报送</button>
+    <button class="secondary" onclick="uploadSample('sample_submissions_corrections.csv')">导入示例补正批次</button>
+    <button class="secondary" onclick="loadRecon()">刷新对账</button>
+    <div id="subMsg" class="msg"></div>
+    <div id="recon"></div>
+  </section>
 </main>
 <script>
 let state = null;
@@ -100,7 +120,7 @@ async function load(){
 function render(){
   const imported = state.imported;
   document.getElementById('importSec').classList.toggle('hidden', imported);
-  for(const id of ['gridSec','selSec','pubSec'])
+  for(const id of ['gridSec','selSec','pubSec','reconSec'])
     document.getElementById(id).classList.toggle('hidden', !imported);
   if(!imported) return;
 
@@ -120,6 +140,8 @@ function render(){
       + pubs.map(p => `<tr><td>${p.id}</td><td>${esc(p.districts.join('、'))}</td><td>${esc(p.age_groups.join('、'))}</td><td>${p.total}</td><td>${esc(p.created_at)}</td></tr>`).join('')
       + '</table>'
     : '<p class="hint">暂无公开记录</p>';
+
+  loadRecon();
 }
 function selection(){
   return {
@@ -174,6 +196,99 @@ async function doPublish(){
     el.className = 'msg ok';
     el.textContent = `已发布 #${r.id}：检出总数 ${r.total}（${esc(r.created_at)}）`;
     await load();
+  }catch(e){ showErr(el, e); }
+}
+
+function diffCell(v){
+  const cls = v > 0 ? 'pos' : (v < 0 ? 'neg' : '');
+  const sign = v > 0 ? '+' : '';
+  return `<td class="${cls}">${sign}${v}</td>`;
+}
+async function loadRecon(){
+  const box = document.getElementById('recon');
+  try{
+    const r = await api('/api/reconciliation');
+    let h = '<h3>逐格对账（当前有效报送 vs 原始调查）</h3>'
+      + '<table><tr><th>分区</th><th>年龄组</th><th>调查人数</th><th>调查检出数</th>'
+      + '<th>报送汇总</th><th>差额（报送−调查）</th><th>贡献报送数</th></tr>';
+    for(const c of r.cells){
+      h += `<tr><td>${esc(c.district)}</td><td>${esc(c.age_group)}</td><td>${c.population}</td>`
+         + `<td>${c.detected}</td><td>${c.report}</td>${diffCell(c.diff)}<td>${c.reported_count}</td></tr>`;
+    }
+    h += `<tr><th colspan="4">合计</th><th>${r.report_total}</th>${diffCell(r.total_diff)}`
+       + `<th>${r.effective_count} 个有效报送ID</th></tr></table>`;
+    h += '<p class="hint">合计差额 = 报送汇总 ' + r.report_total + ' − 调查检出 ' + r.survey_total
+       + ' = ' + r.total_diff + '。逐格与合计出自同一批已提交记录。</p>';
+
+    h += '<h3>额外组合（不在调查格内，单列，不计入上方汇总）</h3>';
+    h += r.extra_contributions.length
+      ? '<table><tr><th>报送ID</th><th>修订号</th><th>分区</th><th>年龄组</th><th>检出数</th><th>人数</th></tr>'
+        + r.extra_contributions.map(e =>
+            `<tr><td>${esc(e.submission_id)}</td><td>${e.revision}</td><td>${esc(e.district)}</td>`
+            + `<td>${esc(e.age_group)}</td><td>${e.detected}</td><td>${e.population}</td></tr>`).join('')
+        + `<tr><th colspan="4">额外组合小计</th><th>${r.extra_total ?? ''}</th><th></th></tr></table>`
+      : '<p class="hint">无额外组合</p>';
+
+    h += '<h3>当前作废的报送ID（撤去全部贡献）</h3>';
+    h += r.voided_ids.length
+      ? '<p>' + r.voided_ids.map(esc).join('、') + '</p>'
+      : '<p class="hint">无</p>';
+
+    h += '<h3>本轮贡献汇总的报送明细（每个 ID 仅最高修订）</h3>';
+    h += r.effective.length
+      ? '<table><tr><th>报送ID</th><th>修订号</th><th>分区</th><th>年龄组</th><th>人数</th>'
+        + '<th>检出数</th><th>作废</th><th>批次</th><th>接收时间 (UTC)</th></tr>'
+        + r.effective.map(s =>
+            `<tr><td>${esc(s.submission_id)}</td><td>${s.revision}</td><td>${esc(s.district)}</td>`
+            + `<td>${esc(s.age_group)}</td><td>${s.population}</td><td>${s.detected}</td>`
+            + `<td>${s.voided ? '是' : '否'}</td><td>${s.batch_id}</td><td>${esc(s.received_at)}</td></tr>`).join('')
+        + '</table>'
+      : '<p class="hint">暂无有效报送</p>';
+
+    h += '<h3>已接收上传批次</h3>';
+    h += r.batches.length
+      ? '<table><tr><th>批次</th><th>文件名</th><th>新接收行</th><th>幂等重传行</th><th>时间 (UTC)</th></tr>'
+        + r.batches.map(b =>
+            `<tr><td>${b.id}</td><td>${esc(b.filename)}</td><td>${b.rows_accepted}</td>`
+            + `<td>${b.rows_duplicate}</td><td>${esc(b.created_at)}</td></tr>`).join('')
+        + '</table>'
+      : '<p class="hint">尚未上传报送</p>';
+    box.innerHTML = h;
+  }catch(e){
+    box.innerHTML = '';
+    const detail = e.body && e.body.detail;
+    if(e.status === 400 && typeof detail === 'string'){
+      box.innerHTML = `<p class="hint">${esc(detail)}</p>`;
+    }else{
+      box.innerHTML = '<p class="hint">对账加载失败</p>';
+    }
+  }
+}
+
+async function uploadSubmissions(){
+  const el = document.getElementById('subMsg');
+  const f = document.getElementById('subFile').files[0];
+  if(!f){ el.className = 'msg err'; el.textContent = '请选择报送 CSV 文件'; return; }
+  await postSubmissions(el, new Blob([f], {type: 'text/csv'}), f.name);
+  document.getElementById('subFile').value = '';
+}
+async function uploadSample(name){
+  const el = document.getElementById('subMsg');
+  try{
+    const text = await (await fetch('/' + name)).text();
+    await postSubmissions(el, new Blob([text], {type: 'text/csv'}), name);
+  }catch(e){ showErr(el, e); }
+}
+async function postSubmissions(el, blob, name){
+  const fd = new FormData();
+  fd.append('file', blob, name);
+  try{
+    const r = await api('/api/submissions/import', {method: 'POST', body: fd});
+    el.className = 'msg ok';
+    el.textContent = `批次 #${r.batch_id} 已接收：解析 ${r.rows_parsed} 行，`
+      + `新增 ${r.rows_accepted}，幂等重传 ${r.rows_duplicate}，`
+      + `迟到旧版留档 ${r.rows_superseded}。`;
+    await loadRecon();
   }catch(e){ showErr(el, e); }
 }
 load();
